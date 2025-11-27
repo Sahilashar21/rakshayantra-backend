@@ -1,0 +1,68 @@
+# -------------------------
+# Node.js
+# -------------------------
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+package-lock.json
+pnpm-lock.yaml
+
+# -------------------------
+# Environment Files
+# (IMPORTANT: Protects API keys)
+# -------------------------
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Google OAuth secret file
+client_secret.json
+credentials.json
+
+# Tokens saved by Google API
+token.json
+
+# -------------------------
+# Logs
+# -------------------------
+logs/
+*.log
+debug.log
+*.out
+*.err
+
+# -------------------------
+# VS Code
+# -------------------------
+.vscode/
+
+# -------------------------
+# OS Files
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Build Output (React & Node)
+# -------------------------
+dist/
+build/
+.cache/
+coverage/
+
+# -------------------------
+# React App
+# -------------------------
+frontend/node_modules/
+frontend/build/
+frontend/.pnp/
+frontend/.pnp.js
+frontend/.parcel-cache
+
+# -------------------------
+# Firebase / temp
+# -------------------------
+.firebase/
