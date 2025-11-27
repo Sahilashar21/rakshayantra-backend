@@ -62,22 +62,61 @@
 
 // module.exports = { getEmails };
 
+// const { google } = require("googleapis");
+
+// async function getEmails(oAuthClient) {
+//   const gmail = google.gmail({ version: "v1", auth: oAuthClient });
+
+//   // Load ONLY 20 recent emails
+//   const res = await gmail.users.messages.list({
+//     userId: "me",
+//     maxResults: 20
+//   });
+
+//   const messages = res.data.messages || [];
+//   let inbox = [];
+
+//   for (let msg of messages) {
+//     let detail = await gmail.users.messages.get({
+//       userId: "me",
+//       id: msg.id,
+//       format: "metadata",
+//       metadataHeaders: ["Subject", "From", "Date"]
+//     });
+
+//     const headers = detail.data.payload.headers;
+
+//     inbox.push({
+//       id: msg.id,
+//       subject: headers.find(h => h.name === "Subject")?.value || "",
+//       from: headers.find(h => h.name === "From")?.value || "",
+//       date: headers.find(h => h.name === "Date")?.value || "",
+//       snippet: detail.data.snippet
+//     });
+//   }
+
+//   return inbox;
+// }
+
+// module.exports = { getEmails };
+
 const { google } = require("googleapis");
 
 async function getEmails(oAuthClient) {
   const gmail = google.gmail({ version: "v1", auth: oAuthClient });
 
-  // Load ONLY 20 recent emails
+  // Load ONLY 20 emails (fast)
   const res = await gmail.users.messages.list({
     userId: "me",
     maxResults: 20
   });
 
   const messages = res.data.messages || [];
+
   let inbox = [];
 
   for (let msg of messages) {
-    let detail = await gmail.users.messages.get({
+    const detail = await gmail.users.messages.get({
       userId: "me",
       id: msg.id,
       format: "metadata",
@@ -88,10 +127,9 @@ async function getEmails(oAuthClient) {
 
     inbox.push({
       id: msg.id,
-      subject: headers.find(h => h.name === "Subject")?.value || "",
+      subject: headers.find(h => h.name === "Subject")?.value || "(No Subject)",
       from: headers.find(h => h.name === "From")?.value || "",
-      date: headers.find(h => h.name === "Date")?.value || "",
-      snippet: detail.data.snippet
+      date: headers.find(h => h.name === "Date")?.value || ""
     });
   }
 
