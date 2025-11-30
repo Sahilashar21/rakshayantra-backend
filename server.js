@@ -663,135 +663,204 @@
 //   console.log("Server running on port 5000");
 // });
 
+const express = require("express");
+const cors = require("cors");
+const { google } = require("googleapis");
 
+require("dotenv").config();
 
-import React, { useEffect, useState } from "react";
-import api from "../api";
-import '../inbox.css';
-export default function InboxPage() {
-  const [emails, setEmails] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [body, setBody] = useState("");
-  const [links, setLinks] = useState([]);
-  const [scans, setScans] = useState([]);
-  const [loading, setLoading] = useState(true);
+const authRoutes = require("./auth");
+const { getEmails } = require("./gmail");
 
-  // Load inbox
-  useEffect(() => {
-    api.get("/emails")
-      .then(res => {
-        setEmails(res.data);
-        setLoading(false);
+const { extractLinks } = require("./extractLinks");
+const { checkUrlSafety } = require("./safeBrowsing");
+const { scanUrlWithVirusTotal } = require("./virusTotal");
+const { scanFileWithVirusTotal } = require("./virusTotalFile");
 
-        if (res.data.length > 0) {
-          loadFullEmail(res.data[0].id, res.data[0]);
-        }
-      })
-      .catch(err => {
-        console.error("INBOX LOAD ERROR:", err);
+const app = express();
+
+app.use(cors({
+  origin: "http://localhost:3000",
+  credentials: true
+}));
+
+app.use("/auth", authRoutes);
+
+// ------------------------------
+// INBOX FETCH (FAST)
+// ------------------------------
+app.get("/emails", async (req, res) => {
+  try {
+    if (!global.oAuthClient) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const inbox = await getEmails(global.oAuthClient);
+    res.json(inbox);
+
+  } catch (err) {
+    console.error("INBOX ERROR:", err);
+    res.status(500).json({ error: "Failed to fetch inbox" });
+  }
+});
+
+// ------------------------------
+// HELPERS
+// ------------------------------
+
+// Recursively extract email body (HTML or text)
+const walkParts = (parts) => {
+  let body = "";
+  for (let part of parts) {
+    if (part.mimeType === "text/plain" && part.body?.data) {
+      body += Buffer.from(part.body.data, "base64").toString();
+    }
+    if (part.mimeType === "text/html" && part.body?.data) {
+      body += Buffer.from(part.body.data, "base64").toString();
+    }
+    if (part.parts) {
+      body += walkParts(part.parts);
+    }
+  }
+  return body;
+};
+
+// Find attachments
+const collectAttachments = (parts, result = []) => {
+  for (let part of parts) {
+    if (part.filename && part.body?.attachmentId) {
+      result.push({
+        filename: part.filename,
+        mimeType: part.mimeType,
+        size: part.body.size,
+        attachmentId: part.body.attachmentId
       });
-  }, []);
+    }
+    if (part.parts) {
+      collectAttachments(part.parts, result);
+    }
+  }
+  return result;
+};
 
-  // Load full body + links + scan results
-  const loadFullEmail = (id, emailMeta) => {
-    setSelected(emailMeta);
-
-    api.get(`/email/${id}`)
-      .then(res => {
-        setBody(res.data.body || "");
-        setLinks(res.data.links || []);
-        setScans(res.data.scans || []);
-      })
-      .catch(err => console.error("EMAIL BODY ERROR:", err));
-  };
-
-  if (loading)
-    return <h2 className="loading">Loading inbox...</h2>;
-
-  return (
-    <>
-      {/* Header */}
-      <div className="header">
-        <div className="logo">RakshaYantra AI</div>
-        <div className="tagline">AI-Powered Phishing Detection & Email Security</div>
-      </div>
-
-      {/* Main Container */}
-      <div className="container">
-        {/* Left Sidebar: Inbox Scanner */}
-        <div className="sidebar">
-          <h2>Inbox Scanner</h2>
-          <div className="search-bar">
-            <input type="text" placeholder="Search emails..." />
-          </div>
-          <a href="http://localhost:5000/auth/login" className="login-btn">
-            Login with Google
-          </a>
-          <ul className="email-list">
-            {emails.map(email => (
-              <li
-                key={email.id}
-                className={`email-item ${selected?.id === email.id ? 'selected' : ''}`}
-                onClick={() => loadFullEmail(email.id, email)}
-              >
-                <h4>{email.subject}</h4>
-                <p>{email.from}</p>
-                <small>{email.date}</small>
-              </li>
-            ))}
-          </ul>
-        </div>
-
-        {/* Right Panel: Email Analysis */}
-        <div className="main-panel">
-          {selected ? (
-            <>
-              <h2>{selected.subject}</h2>
-              <p>{selected.from}</p>
-              <i>{selected.date}</i>
-              <hr />
-              <div className="email-body" dangerouslySetInnerHTML={{ __html: body }} />
-              <hr />
-              <div className="links-section">
-                <h3>Extracted Links:</h3>
-                {links.length === 0 ? <p>No links found</p> : (
-                  <ul className="links-list">
-                    {links.map((l, i) => (
-                      <li key={i}>
-                        <a href={l} target="_blank" rel="noreferrer">{l}</a>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-              <hr />
-              <div className="scans-section">
-                <h3>Scan Results:</h3>
-                {scans.map((s, i) => (
-                  <div key={i} className="scan-item">
-                    <b>{s.link}</b>
-                    <div className={`status ${s.safe ? 'safe' : 'dangerous'}`}>
-                      {s.safe ? 'SAFE ✓' : `DANGEROUS — ${s.threat}`}
-                    </div>
-                    <div className="progress-bar">
-                      <div className={`progress-fill ${!s.safe ? 'danger' : ''}`}></div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </>
-          ) : (
-            <div className="no-selection">
-              <h2>Select an email to analyze</h2>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Footer */}
-      <div className="footer">
-        RakshaYantra AI - Protecting Against Phishing Threats | <a href="#">Learn More</a> | Powered by Advanced AI
-      </div>
-    </>
-  );
+// Decode gmail base64url
+function decodeBase64Url(data) {
+  data = data.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(data, "base64");
 }
+
+// ------------------------------
+// FULL EMAIL FETCH + SCANNING
+// ------------------------------
+app.get("/email/:id", async (req, res) => {
+  try {
+    if (!global.oAuthClient) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+
+    const gmail = google.gmail({ version: "v1", auth: global.oAuthClient });
+
+    const email = await gmail.users.messages.get({
+      userId: "me",
+      id: req.params.id,
+      format: "full",
+    });
+
+    const payload = email.data.payload;
+
+    // -------------------------
+    // 1) BODY EXTRACTION
+    // -------------------------
+    let body = "";
+    if (payload.parts) {
+      body = walkParts(payload.parts);
+    } else if (payload.body?.data) {
+      body = Buffer.from(payload.body.data, "base64").toString();
+    }
+
+    // -------------------------
+    // 2) URL EXTRACTION
+    // -------------------------
+    const links = await extractLinks(body);
+
+    // -------------------------
+    // 3) URL SCANNING
+    // -------------------------
+    let urlScans = [];
+    for (let url of links) {
+      const safeResult = await checkUrlSafety(url);
+      const vtResult = await scanUrlWithVirusTotal(url);
+
+      urlScans.push({
+        link: url,
+        googleSafe: safeResult.safe,
+        googleThreat: safeResult.threat,
+        vtMalicious: vtResult.malicious,
+        vtSuspicious: vtResult.suspicious,
+        vtHarmless: vtResult.harmless,
+      });
+    }
+
+    // -------------------------
+    // 4) ATTACHMENT EXTRACTION
+    // -------------------------
+    let attachments = [];
+    if (payload.parts) {
+      attachments = collectAttachments(payload.parts);
+    }
+
+    // -------------------------
+    // 5) ATTACHMENT SCANNING
+    // Limit to 2 attachments for VirusTotal free tier
+    // -------------------------
+    let attachmentScans = [];
+
+    for (let i = 0; i < Math.min(attachments.length, 2); i++) {
+      const att = attachments[i];
+
+      const fileResponse = await gmail.users.messages.attachments.get({
+        userId: "me",
+        messageId: req.params.id,
+        id: att.attachmentId
+      });
+
+      const fileBuffer = decodeBase64Url(fileResponse.data.data);
+
+      const vtFileResult = await scanFileWithVirusTotal(
+        fileBuffer,
+        att.filename
+      );
+
+      attachmentScans.push({
+        filename: att.filename,
+        mimeType: att.mimeType,
+        size: att.size,
+        vtMalicious: vtFileResult.malicious,
+        vtSuspicious: vtFileResult.suspicious,
+        vtHarmless: vtFileResult.harmless
+      });
+    }
+
+    // -------------------------
+    // SEND COMBINED RESULT
+    // -------------------------
+    res.json({
+      snippet: email.data.snippet,
+      body,
+      links,
+      urlScans,
+      attachments,
+      attachmentScans
+    });
+
+  } catch (err) {
+    console.error("FULL EMAIL ERROR:", err);
+    res.status(500).json({ error: "Failed to load full email" });
+  }
+});
+
+app.listen(5000, () => {
+  console.log("🚀 Server running on http://localhost:5000");
+});
+
+
