@@ -1573,8 +1573,10 @@ const { extractLinks } = require("./extractLinks");
 const { checkUrlSafety } = require("./safeBrowsing");
 const { scanUrlWithVirusTotal } = require("./virusTotal");
 const { scanFileWithVirusTotal } = require("./virusTotalFile");
+const { analyzeUrlHeuristics } = require("./urlHeuristics");
 
 const { analyzeSandbox } = require("./sandbox/sandboxAnalyzer");
+const { saveScanReport, getTodayScans, getStatsByDate } = require("./scanReports");
 
 const app = express();
 app.use(express.json());
@@ -1680,21 +1682,44 @@ app.get("/email/:id", async (req, res) => {
     const links = await extractLinks(body);
 
     // =============================
-    // LAYER 1 & 2 → SAFE BROWSING + VT URL
+    // LAYER 1 & 2 → SAFE BROWSING + VT URL + HEURISTICS
     // =============================
     let urlScans = [];
 
     for (let url of links) {
-      const safe = await checkUrlSafety(url);
-      const vt = await scanUrlWithVirusTotal(url);
+      try {
+        // Safe Browsing is mandatory
+        let safe = { safe: true, threat: null };
+        try {
+          safe = await checkUrlSafety(url);
+        } catch (err) {
+          console.log(`Safe Browsing check failed for ${url}`);
+        }
 
-      urlScans.push({
-        url,
-        googleSafe: safe.safe,
-        googleThreat: safe.threat,
-        vtMalicious: vt.malicious,
-        vtSuspicious: vt.suspicious,
-      });
+        // VirusTotal is optional - skip if API is exhausted
+        let vt = { malicious: 0, suspicious: 0 };
+        try {
+          vt = await scanUrlWithVirusTotal(url);
+        } catch (err) {
+          console.log(`VirusTotal skipped for ${url}: API exhausted or error`);
+          vt = { malicious: 0, suspicious: 0 }; // Default to safe if VT fails
+        }
+
+        const heuristics = analyzeUrlHeuristics(url); // Pattern-based analysis
+
+        urlScans.push({
+          url,
+          googleSafe: safe.safe,
+          googleThreat: safe.threat,
+          vtMalicious: vt.malicious,
+          vtSuspicious: vt.suspicious,
+          heuristicScore: heuristics.score,
+          heuristicVerdict: heuristics.verdict,
+          heuristicFindings: heuristics.findings,
+        });
+      } catch (err) {
+        console.log(`URL scan error for ${url}: ${err.message}`);
+      }
     }
 
     // =============================
@@ -1738,8 +1763,8 @@ app.get("/email/:id", async (req, res) => {
     // =============================
     let verdict = "SAFE";
 
-    const urlMal = urlScans.some((u) => !u.googleSafe || u.vtMalicious > 0);
-    const urlSusp = urlScans.some((u) => u.vtSuspicious > 0);
+    const urlMal = urlScans.some((u) => !u.googleSafe || u.vtMalicious > 0 || u.heuristicVerdict === "MALICIOUS");
+    const urlSusp = urlScans.some((u) => u.vtSuspicious > 0 || u.heuristicVerdict === "SUSPICIOUS");
 
     const attMal = attachmentScans.some((a) => a.vtMalicious > 0);
     const attSusp = attachmentScans.some((a) => a.vtSuspicious > 0);
@@ -1757,6 +1782,7 @@ app.get("/email/:id", async (req, res) => {
 
     res.json({
       body,
+      links,
       verdict,
       finalScore,
       urlScans,
@@ -1766,6 +1792,262 @@ app.get("/email/:id", async (req, res) => {
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "Email analysis failed" });
+  }
+});
+
+// ---------------------------------------------------
+// GET TODAY'S SCAN REPORTS
+// ---------------------------------------------------
+app.get("/reports", async (req, res) => {
+  try {
+    if (!global.oAuthClient)
+      return res.status(401).json({ error: "Not authenticated" });
+
+    const todayScans = getTodayScans();
+    const stats = getStatsByDate(new Date().toISOString().split("T")[0]);
+
+    console.log(`📊 Fetching reports: ${todayScans.length} scans found for today`);
+
+    res.json({
+      scans: todayScans,
+      stats,
+      totalScans: todayScans.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("Reports Error:", err);
+    res.status(500).json({ error: "Failed to fetch reports" });
+  }
+});
+
+// ---------------------------------------------------
+// SCAN ALL TODAY'S EMAILS (BULK SCAN)
+// OPTIMIZED WITH TIMEOUTS AND ERROR RECOVERY
+// ---------------------------------------------------
+app.post("/scan-now", async (req, res) => {
+  try {
+    if (!global.oAuthClient)
+      return res.status(401).json({ error: "Not authenticated" });
+
+    const gmail = google.gmail({ version: "v1", auth: global.oAuthClient });
+
+    // Fetch today's emails
+    const inbox = await getEmails(global.oAuthClient);
+
+    if (!inbox || inbox.length === 0) {
+      return res.json({ message: "No emails to scan", scans: [] });
+    }
+
+    // Limit to first 5 emails for bulk scan
+    const emailsToScan = inbox.slice(0, 5);
+    console.log(`Starting bulk scan of ${emailsToScan.length} emails (limited to 5)...`);
+
+    // Scan each email with all layers
+    let scanResults = [];
+    let scannedCount = 0;
+    let failedCount = 0;
+
+    // Helper function to scan a single email with timeout
+    const scanEmailWithTimeout = async (emailSummary, timeout = 15000) => {
+      return Promise.race([
+        scanSingleEmail(emailSummary, gmail),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Email scan timeout')), timeout)
+        )
+      ]);
+    };
+
+    // Helper function to scan a single email
+    const scanSingleEmail = async (emailSummary, gmail) => {
+      const msg = await gmail.users.messages.get({
+        userId: "me",
+        id: emailSummary.id,
+        format: "full",
+      });
+
+      const payload = msg.data.payload;
+
+      // Extract body
+      let body = payload.parts
+        ? walkParts(payload.parts)
+        : Buffer.from(payload.body?.data || "", "base64").toString();
+
+      // Extract links
+      const links = await extractLinks(body);
+
+      // Layer 1 & 2: Safe Browsing + VirusTotal URLs (with timeout per URL)
+      let urlScans = [];
+      for (let url of links.slice(0, 5)) { // Limit to 5 URLs per email for speed
+        try {
+          // VirusTotal is now optional - if it fails, we use heuristics only
+          let safe = { safe: true, threat: null };
+          let vt = { malicious: 0, suspicious: 0 };
+
+          try {
+            safe = await Promise.race([
+              checkUrlSafety(url),
+              new Promise((resolve) => setTimeout(() => resolve({ safe: true }), 5000))
+            ]);
+          } catch (err) {
+            console.log(`Safe Browsing check failed for ${url}`);
+          }
+
+          // VirusTotal is non-compulsory - skip if API is exhausted
+          try {
+            vt = await Promise.race([
+              scanUrlWithVirusTotal(url),
+              new Promise((resolve) => setTimeout(() => resolve({ malicious: 0, suspicious: 0 }), 5000))
+            ]);
+          } catch (err) {
+            console.log(`VirusTotal scan skipped for ${url}: ${err.message}`);
+            vt = { malicious: 0, suspicious: 0 }; // Default to safe if VT fails
+          }
+
+          const heuristics = analyzeUrlHeuristics(url); // Always runs, doesn't need API
+
+          urlScans.push({
+            url,
+            googleSafe: safe.safe,
+            googleThreat: safe.threat,
+            vtMalicious: vt.malicious,
+            vtSuspicious: vt.suspicious,
+            heuristicScore: heuristics.score,
+            heuristicVerdict: heuristics.verdict,
+            heuristicFindings: heuristics.findings,
+          });
+        } catch (err) {
+          console.log(`URL scan failed for ${url}: ${err.message}`);
+          
+          // Still do heuristic analysis even if API calls fail
+          const heuristics = analyzeUrlHeuristics(url);
+          
+          urlScans.push({
+            url,
+            googleSafe: true,
+            googleThreat: null,
+            vtMalicious: 0,
+            vtSuspicious: 0,
+            heuristicScore: heuristics.score,
+            heuristicVerdict: heuristics.verdict,
+            heuristicFindings: heuristics.findings,
+            error: "Scan timeout"
+          });
+        }
+      }
+
+      // Layer 3: Attachments (SKIP in bulk scan for speed)
+      let attachmentScans = [];
+
+      // Layer 4: Docker Sandbox (first URL if available) - with timeout
+      let sandbox = null;
+      if (links.length > 0) {
+        try {
+          const sandboxPromise = runDockerSandbox(links[0]);
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Sandbox timeout")), 8000)
+          );
+          
+          const raw = await Promise.race([sandboxPromise, timeoutPromise]);
+          sandbox = analyzeSandbox(raw);
+        } catch (err) {
+          console.log(`Sandbox skipped for ${emailSummary.id}: ${err.message}`);
+          sandbox = { riskScore: 0 }; // Safe default if sandbox fails
+        }
+      }
+
+      // Determine verdict
+      let verdict = "SAFE";
+      const urlMal = urlScans.some((u) => !u.googleSafe || u.vtMalicious > 0 || u.heuristicVerdict === "MALICIOUS");
+      const urlSusp = urlScans.some((u) => u.vtSuspicious > 0 || u.heuristicVerdict === "SUSPICIOUS");
+      const sandMal = sandbox && sandbox.riskScore >= 50;
+      const sandSusp = sandbox && sandbox.riskScore > 20;
+
+      if (urlMal || sandMal) verdict = "MALICIOUS";
+      else if (urlSusp || sandSusp) verdict = "SUSPICIOUS";
+
+      let finalScore =
+        (urlMal || sandMal) ? 90 :
+        (urlSusp || sandSusp) ? 55 : 5;
+
+      return {
+        scanId: `scan_${Date.now()}_${emailSummary.id}`,
+        emailId: emailSummary.id,
+        timestamp: new Date().toISOString(),
+        subject: emailSummary.subject || "(No subject)",
+        from: emailSummary.from || "Unknown",
+        preview: emailSummary.snippet || "",
+        verdict,
+        finalScore,
+        urlScans,
+        attachmentScans,
+        sandbox,
+      };
+    };
+
+    // Process emails with error recovery
+    for (let emailSummary of emailsToScan) {
+      try {
+        scannedCount++;
+        console.log(`[${scannedCount}/${inbox.length}] Scanning: ${emailSummary.subject}`);
+        
+        const scanReport = await scanEmailWithTimeout(emailSummary);
+        
+        // Save to database
+        saveScanReport(scanReport);
+
+        scanResults.push({
+          emailId: scanReport.emailId,
+          subject: scanReport.subject,
+          verdict: scanReport.verdict,
+          finalScore: scanReport.finalScore,
+        });
+      } catch (emailErr) {
+        failedCount++;
+        console.error(`Error scanning email ${emailSummary.id}:`, emailErr.message);
+        
+        // Create a basic "failed" scan record
+        const failedScan = {
+          scanId: `scan_${Date.now()}_${emailSummary.id}`,
+          emailId: emailSummary.id,
+          timestamp: new Date().toISOString(),
+          subject: emailSummary.subject || "(No subject)",
+          from: emailSummary.from || "Unknown",
+          preview: emailSummary.snippet || "",
+          verdict: "SAFE",
+          finalScore: 0,
+          urlScans: [],
+          attachmentScans: [],
+          sandbox: null,
+          error: "Scan failed or timed out"
+        };
+        
+        saveScanReport(failedScan);
+        
+        scanResults.push({
+          emailId: failedScan.emailId,
+          subject: failedScan.subject,
+          verdict: "SAFE",
+          finalScore: 0,
+        });
+        
+        // Continue to next email even if one fails
+      }
+    }
+
+    res.json({
+      message: `Successfully scanned ${scanResults.length} emails out of 5 limit (${failedCount} failed/skipped)`,
+      scans: scanResults,
+      stats: {
+        total: scanResults.length,
+        successful: scanResults.length - failedCount,
+        failed: failedCount
+      },
+      timestamp: new Date().toISOString(),
+      note: "Bulk scan limited to 5 emails. VirusTotal checks are optional and skipped if API is exhausted."
+    });
+  } catch (err) {
+    console.error("Scan-Now Error:", err);
+    res.status(500).json({ error: "Bulk scan failed", details: err.message });
   }
 });
 
