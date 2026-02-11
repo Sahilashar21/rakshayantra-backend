@@ -37,7 +37,16 @@ function analyzeUrlHeuristics(url) {
       { brand: 'facebook', patterns: ['faceb00k', 'facebok', 'facebk'] },
       { brand: 'instagram', patterns: ['instagrarn', 'instagramm', 'instgrm'] },
       { brand: 'netflix', patterns: ['netfliix', 'netflx', 'netf1ix'] },
-      { brand: 'bank', patterns: ['b4nk', 'bankk', 'bsnk'] }
+      { brand: 'bank', patterns: ['b4nk', 'bankk', 'bsnk'] },
+      // Indian Banks - Critical for India
+      { brand: 'sbi', patterns: ['sbi-', 'sbionline-', 'sbi-secure', 'sbi-verify', 'sbi-login', 'securesbi', 'sbisecure'] },
+      { brand: 'hdfc', patterns: ['hdfc-', 'hdfcbank-', 'hdfc-secure', 'hdfc-verify', 'secure-hdfc'] },
+      { brand: 'icici', patterns: ['icici-', 'icicbank-', 'icici-secure', 'icici-verify', 'secure-icici'] },
+      { brand: 'axis', patterns: ['axis-', 'axisbank-', 'axis-secure', 'axis-verify', 'secure-axis'] },
+      { brand: 'kotak', patterns: ['kotak-', 'kotakbank-', 'kotak-secure', 'kotak-verify'] },
+      { brand: 'yes', patterns: ['yesbank-', 'yes-bank-', 'yes-secure', 'yesbank-login'] },
+      { brand: 'aadhar', patterns: ['aadhar-', 'aadhaar-', 'aadhar-verify', 'aadhar-update', 'verify-aadhar'] },
+      { brand: 'pan', patterns: ['pan-', 'pancard-', 'pan-verify', 'pan-update', 'verify-pan'] }
     ];
 
     for (const { brand, patterns } of brandPatterns) {
@@ -91,14 +100,27 @@ function analyzeUrlHeuristics(url) {
     }
 
     // 8. Misleading domain structure (e.g., paypal-secure.malicious.com)
-    const trustedBrands = ['paypal', 'amazon', 'google', 'microsoft', 'apple', 'bank', 'chase', 'wellsfargo'];
+    const trustedBrands = ['paypal', 'amazon', 'google', 'microsoft', 'apple', 'bank', 'chase', 'wellsfargo', 'sbi', 'hdfc', 'icici', 'axis', 'kotak', 'yes', 'aadhar'];
     trustedBrands.forEach(brand => {
-      // If brand name appears but not as main domain
+      // If brand name appears but not as main domain - STRONG indicator of spoofing
       if (domain.includes(brand) && !domain.includes(`.${brand}.com`) && !domain.endsWith(`${brand}.com`)) {
-        suspiciousScore += 35;
-        findings.push(`Misleading use of "${brand}" in domain`);
+        suspiciousScore += 40;  // Increased score
+        findings.push(`Misleading use of "${brand}" in domain - Possible spoofing`);
       }
     });
+
+    // 9. Domain spoofing patterns (e.g., sbi-secure-check.in looks like SBI but isn't)
+    const spoofingPatterns = [
+      // Pattern: brand-word.non-official-tld (e.g., sbi-secure.in, hdfc-verify.co.in)
+      /^[a-z0-9]*(sbi|hdfc|icici|axis|kotak|yesbank|aadhar)[-_][a-z0-9]*(secure|verify|login|check|update|confirm|account|banking)[-a-z0-9]*\.(in|co\.in|io|net|org|info|biz|top|xyz)$/,
+      // Pattern: secure/verify + brand name + non-official domain
+      /^(secure|verify|login|update|confirm|account|banking)?[-_]?(sbi|hdfc|icici|axis|kotak|yesbank|aadhar)[-a-z0-9]*(\.(in|co\.in|io|net|org|info|biz|top|xyz))$/
+    ];
+    
+    if (spoofingPatterns.some(pattern => pattern.test(domain))) {
+      suspiciousScore += 50;  // Very high score for spoofing
+      findings.push("Domain spoofing detected - Imitates legitimate bank/service");
+    }
 
     // 9. HTTPS with suspicious domain (false sense of security)
     if (urlObj.protocol === 'https:' && suspiciousScore > 30) {

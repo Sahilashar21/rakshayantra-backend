@@ -1796,6 +1796,90 @@ app.get("/email/:id", async (req, res) => {
 });
 
 // ---------------------------------------------------
+// ANALYZE MESSAGE (WhatsApp/SMS/Chat)
+// PUBLIC ENDPOINT - NO AUTH REQUIRED
+// ---------------------------------------------------
+app.post("/analyze-message", async (req, res) => {
+  try {
+    const { message } = req.body;
+
+    if (!message || message.trim() === "") {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    // Extract links from message
+    const links = await extractLinks(message);
+
+    // 4-Layer Security Analysis
+    let urlScans = [];
+
+    for (let url of links) {
+      try {
+        // Layer 1: Safe Browsing
+        let safe = { safe: true, threat: null };
+        try {
+          safe = await checkUrlSafety(url);
+        } catch (err) {
+          console.log(`Safe Browsing check failed for ${url}`);
+        }
+
+        // Layer 2: VirusTotal (optional)
+        let vt = { malicious: 0, suspicious: 0 };
+        try {
+          vt = await scanUrlWithVirusTotal(url);
+        } catch (err) {
+          console.log(`VirusTotal skipped for ${url}: API unavailable`);
+          vt = { malicious: 0, suspicious: 0 };
+        }
+
+        // Layer 3: Heuristic Analysis
+        const heuristics = analyzeUrlHeuristics(url);
+
+        urlScans.push({
+          url,
+          googleSafe: safe.safe,
+          googleThreat: safe.threat,
+          vtMalicious: vt.malicious,
+          vtSuspicious: vt.suspicious,
+          heuristicScore: heuristics.score,
+          heuristicVerdict: heuristics.verdict,
+          heuristicFindings: heuristics.findings,
+        });
+      } catch (err) {
+        console.log(`URL scan error for ${url}: ${err.message}`);
+      }
+    }
+
+    // Determine overall verdict
+    let verdict = "SAFE";
+    const urlMal = urlScans.some(
+      (u) => !u.googleSafe || u.vtMalicious > 0 || u.heuristicVerdict === "MALICIOUS"
+    );
+    const urlSusp = urlScans.some(
+      (u) => u.vtSuspicious > 0 || u.heuristicVerdict === "SUSPICIOUS"
+    );
+
+    if (urlMal) verdict = "MALICIOUS";
+    else if (urlSusp) verdict = "SUSPICIOUS";
+
+    const finalScore = urlMal ? 90 : urlSusp ? 55 : 5;
+
+    res.json({
+      message: message.substring(0, 200), // Return first 200 chars
+      messageLength: message.length,
+      links,
+      verdict,
+      finalScore,
+      urlScans,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("Message analysis error:", err);
+    res.status(500).json({ error: "Message analysis failed", details: err.message });
+  }
+});
+
+// ---------------------------------------------------
 // GET TODAY'S SCAN REPORTS
 // ---------------------------------------------------
 app.get("/reports", async (req, res) => {
@@ -2048,6 +2132,139 @@ app.post("/scan-now", async (req, res) => {
   } catch (err) {
     console.error("Scan-Now Error:", err);
     res.status(500).json({ error: "Bulk scan failed", details: err.message });
+  }
+});
+
+// ---------------------------------------------------
+// FILE SCAN ENDPOINT (For Download Protection)
+// Uses Docker Sandbox for file analysis
+// ---------------------------------------------------
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+
+// Configure multer for memory storage
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB max
+  },
+});
+
+app.post("/scan-file", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const filename = req.file.originalname;
+    const fileBuffer = req.file.buffer;
+    const fileSize = req.file.size;
+
+    console.log(`📁 Scanning file: ${filename} (${fileSize} bytes)`);
+
+    // Analyze file extension and type
+    const ext = path.extname(filename).toLowerCase();
+    const dangerousExtensions = [
+      ".exe", ".bat", ".cmd", ".com", ".scr", ".vbs", ".js",
+      ".jar", ".msi", ".app", ".deb", ".rpm", ".sh", ".ps1"
+    ];
+
+    let riskScore = 0;
+    let findings = [];
+
+    // Check file extension
+    if (dangerousExtensions.includes(ext)) {
+      riskScore += 60;
+      findings.push(`Executable file type detected (${ext})`);
+    }
+
+    // Check for double extension trick (e.g., .pdf.exe)
+    const nameWithoutExt = path.basename(filename, ext);
+    if (nameWithoutExt.includes(".")) {
+      riskScore += 30;
+      findings.push("Double extension detected (common malware trick)");
+    }
+
+    // Check file size
+    if (fileSize < 1024) {
+      riskScore += 20;
+      findings.push("Suspiciously small file size");
+    }
+
+    // Analyze file content for patterns
+    const content = fileBuffer.toString("utf8", 0, Math.min(10000, fileSize));
+    
+    // Check for suspicious patterns in content
+    if (content.includes("powershell") || content.includes("cmd.exe")) {
+      riskScore += 40;
+      findings.push("Contains command-line execution patterns");
+    }
+
+    if (content.match(/eval\(|atob\(|fromCharCode/)) {
+      riskScore += 35;
+      findings.push("Contains obfuscated code patterns");
+    }
+
+    // Try to save file temporarily and scan with Docker sandbox if it's a URL-based file
+    let sandbox = null;
+    
+    // For HTML/HTM files, we can scan them with the sandbox
+    if (['.html', '.htm'].includes(ext)) {
+      try {
+        const tempPath = path.join(__dirname, `temp_${Date.now()}.html`);
+        fs.writeFileSync(tempPath, fileBuffer);
+        
+        // Create a file:// URL for the sandbox
+        const fileUrl = `file://${tempPath}`;
+        const raw = await runDockerSandbox(fileUrl);
+        sandbox = analyzeSandbox(raw);
+        
+        // Clean up
+        fs.unlinkSync(tempPath);
+        
+        if (sandbox.riskScore) {
+          riskScore += sandbox.riskScore;
+        }
+      } catch (err) {
+        console.log("Sandbox scan skipped:", err.message);
+      }
+    }
+
+    // Cap score at 100
+    if (riskScore > 100) riskScore = 100;
+
+    // Determine verdict
+    let verdict = "SAFE";
+    if (riskScore >= 70) {
+      verdict = "MALICIOUS";
+    } else if (riskScore >= 40) {
+      verdict = "SUSPICIOUS";
+    }
+
+    const scanResult = {
+      filename,
+      fileSize,
+      fileType: ext || "unknown",
+      riskScore,
+      verdict,
+      findings,
+      sandbox: sandbox ? {
+        riskScore: sandbox.riskScore,
+        flags: sandbox.flags
+      } : null,
+      scannedAt: new Date().toISOString(),
+    };
+
+    console.log(`✅ File scan complete: ${filename} - ${verdict} (${riskScore})`);
+
+    res.json(scanResult);
+  } catch (err) {
+    console.error("File scan error:", err);
+    res.status(500).json({ 
+      error: "File scan failed", 
+      details: err.message 
+    });
   }
 });
 
